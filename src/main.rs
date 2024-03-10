@@ -5,6 +5,7 @@ use iced::executor;
 use iced::mouse;
 use iced::theme::Theme;
 use iced::widget::canvas::{Cache, Geometry, LineCap, Path, Stroke, Style};
+use iced::widget::Column;
 use iced::widget::{button, canvas, column, container, slider, text, Row};
 use iced::{
     Application, Color, Command, Element, Length, Point, Rectangle, Settings, Size, Subscription,
@@ -17,6 +18,7 @@ const GROUND_COLOR: Color = Color::from_rgb(0.5, 0.5, 0.5);
 const GROUND_RESTITUTION: f32 = 0.7;
 
 const GRAVITY: Vector<f32> = vector![0.0, -9.81];
+// const GRAVITY: Vector<f32> = vector![0.0, 0.0];
 
 const SCALE_FACTOR: f32 = 50.0;
 const BACKGROUND_COLOR: Color = Color::WHITE;
@@ -29,17 +31,24 @@ pub fn main() -> iced::Result {
 
 struct Capsule {
     body_handle: RigidBodyHandle,
+    collider_handle: ColliderHandle,
     length: f32,
     radius: f32,
     angle: f32,
     color: Color,
-    restitution: f32,
-    initial_height: f32,
+}
+
+struct Hinge {
+    capsules: [Capsule; 2],
+    joint_handle: ImpulseJointHandle,
+    origin: Point,
+    min_angle: f32,
+    max_angle: f32,
 }
 
 struct PhysicsSimulation {
-    capsules: Vec<Capsule>,
-    selected_capsule_index: usize,
+    hinges: Vec<Hinge>,
+    selected_hinge_index: usize,
     rigid_body_set: RigidBodySet,
     collider_set: ColliderSet,
     integration_parameters: IntegrationParameters,
@@ -64,15 +73,17 @@ enum Message {
     TogglePlayback,
     ResetSimulation,
     StepSimulation,
-    CapsuleSelected(usize),
-    CapsuleLengthChanged(f32),
-    CapsuleRadiusChanged(f32),
-    CapsuleAngleChanged(f32),
+    HingeSelected(usize),
+    CapsuleLengthChanged(usize, f32),
+    CapsuleRadiusChanged(usize, f32),
+    CapsuleAngleChanged(usize, f32),
+    JointMinAngleChanged(f32),
+    JointMaxAngleChanged(f32),
 }
 
 impl PhysicsSimulation {
     fn init_world(&mut self) {
-        // iterate over all the rigid bodies and remove them
+        // Iterate over all the rigid bodies and remove them
         let rigid_body_handles: Vec<_> = self
             .rigid_body_set
             .iter()
@@ -89,27 +100,82 @@ impl PhysicsSimulation {
             );
         }
 
+        // Iterate over all the joints and remove them
+        let joint_handles: Vec<_> = self
+            .impulse_joint_set
+            .iter()
+            .map(|(handle, _)| handle)
+            .collect();
+        for joint_handle in joint_handles {
+            self.impulse_joint_set.remove(joint_handle, true);
+        }
+
         // Create the ground
         let ground_collider = ColliderBuilder::cuboid(GROUND_WIDTH, GROUND_HEIGHT)
             .restitution(GROUND_RESTITUTION)
+            .collision_groups(InteractionGroups::new(0b0001.into(), 0b1111.into()))
             .build();
         self.collider_set.insert(ground_collider);
 
-        // Create the bouncing capsules
-        for capsule in &mut self.capsules {
-            let capsule_body = RigidBodyBuilder::dynamic()
-                .translation(vector![0.0, capsule.initial_height])
-                .rotation(capsule.angle)
+        // Create the hinges
+        for hinge in &mut self.hinges {
+            let hinge_group = 0b0001;
+            let capsule1_group = 0b0010;
+            let capsule2_group = 0b0100;
+
+            // Create the first capsule
+            let capsule1_body = RigidBodyBuilder::dynamic()
+                .translation(vector![hinge.origin.x, hinge.origin.y])
+                .rotation(hinge.capsules[0].angle)
                 .build();
-            let capsule_collider =
-                ColliderBuilder::capsule_x(capsule.length / 2.0, capsule.radius / 2.0)
-                    .restitution(capsule.restitution)
-                    .build();
-            capsule.body_handle = self.rigid_body_set.insert(capsule_body);
-            self.collider_set.insert_with_parent(
-                capsule_collider,
-                capsule.body_handle,
+            let capsule1_collider = ColliderBuilder::capsule_y(
+                hinge.capsules[0].length / 2.0,
+                hinge.capsules[0].radius / 2.0,
+            )
+            .collision_groups(InteractionGroups::new(
+                capsule1_group.into(),
+                hinge_group.into(),
+            ))
+            .build();
+            hinge.capsules[0].body_handle = self.rigid_body_set.insert(capsule1_body);
+            hinge.capsules[0].collider_handle = self.collider_set.insert_with_parent(
+                capsule1_collider,
+                hinge.capsules[0].body_handle,
                 &mut self.rigid_body_set,
+            );
+
+            // Create the second capsule
+            let capsule2_body = RigidBodyBuilder::dynamic()
+                .translation(vector![hinge.origin.x, hinge.origin.y])
+                .rotation(hinge.capsules[1].angle)
+                .build();
+            let capsule2_collider = ColliderBuilder::capsule_y(
+                hinge.capsules[1].length / 2.0,
+                hinge.capsules[1].radius / 2.0,
+            )
+            .collision_groups(InteractionGroups::new(
+                capsule2_group.into(),
+                hinge_group.into(),
+            ))
+            .build();
+            hinge.capsules[1].body_handle = self.rigid_body_set.insert(capsule2_body);
+            hinge.capsules[1].collider_handle = self.collider_set.insert_with_parent(
+                capsule2_collider,
+                hinge.capsules[1].body_handle,
+                &mut self.rigid_body_set,
+            );
+
+            // Create the revolute joint
+            let revolute_joint = RevoluteJointBuilder::new()
+                .local_anchor1(point![0.0, 0.0])
+                .local_anchor2(point![0.0, 0.0])
+                .limits([hinge.min_angle, hinge.max_angle])
+                .build();
+            hinge.joint_handle = self.impulse_joint_set.insert(
+                hinge.capsules[0].body_handle,
+                hinge.capsules[1].body_handle,
+                revolute_joint,
+                true,
             );
         }
     }
@@ -141,28 +207,44 @@ impl Application for PhysicsSimulation {
 
     fn new(_flags: ()) -> (Self, Command<Message>) {
         let mut app = PhysicsSimulation {
-            capsules: vec![
-                Capsule {
-                    body_handle: RigidBodyHandle::invalid(),
-                    length: 2.0,
-                    radius: 0.5,
-                    angle: 0.0,
-                    color: Color::from_rgb(0.0, 0.5, 0.8),
-                    restitution: 0.7,
-                    initial_height: 8.0,
+            hinges: vec![
+                Hinge {
+                    capsules: [
+                        Capsule {
+                            body_handle: RigidBodyHandle::invalid(),
+                            collider_handle: ColliderHandle::invalid(),
+                            length: 2.0,
+                            radius: 0.5,
+                            angle: 0.0,
+                            color: Color {
+                                r: 0.0,
+                                g: 0.5,
+                                b: 0.8,
+                                a: 0.5,
+                            },
+                        },
+                        Capsule {
+                            body_handle: RigidBodyHandle::invalid(),
+                            collider_handle: ColliderHandle::invalid(),
+                            length: 2.0,
+                            radius: 0.5,
+                            angle: 0.0,
+                            color: Color {
+                                r: 0.8,
+                                g: 0.5,
+                                b: 0.0,
+                                a: 0.5,
+                            },
+                        },
+                    ],
+                    joint_handle: ImpulseJointHandle::invalid(),
+                    origin: Point::new(0.0, 5.0),
+                    min_angle: -std::f32::consts::FRAC_PI_2,
+                    max_angle: std::f32::consts::FRAC_PI_2,
                 },
-                Capsule {
-                    body_handle: RigidBodyHandle::invalid(),
-                    length: 4.0,
-                    radius: 0.5,
-                    angle: 0.0,
-                    color: Color::from_rgb(0.0, 0.5, 0.8),
-                    restitution: 0.7,
-                    initial_height: 4.0,
-                },
-                // Add more capsules here...
+                // Add more hinges here...
             ],
-            selected_capsule_index: 0,
+            selected_hinge_index: 0,
             rigid_body_set: RigidBodySet::new(),
             collider_set: ColliderSet::new(),
             integration_parameters: IntegrationParameters::default(),
@@ -187,7 +269,7 @@ impl Application for PhysicsSimulation {
     }
 
     fn title(&self) -> String {
-        String::from("Bouncing Capsules - Iced")
+        String::from("Revolute Joint Limits - Iced")
     }
 
     fn update(&mut self, message: Message) -> Command<Message> {
@@ -211,21 +293,31 @@ impl Application for PhysicsSimulation {
                     self.cache.clear();
                 }
             }
-            Message::CapsuleSelected(index) => {
-                self.selected_capsule_index = index;
+            Message::HingeSelected(index) => {
+                self.selected_hinge_index = index;
             }
-            Message::CapsuleLengthChanged(length) => {
-                self.capsules[self.selected_capsule_index].length = length;
+            Message::CapsuleLengthChanged(capsule_index, length) => {
+                self.hinges[self.selected_hinge_index].capsules[capsule_index].length = length;
                 self.init_world();
                 self.cache.clear();
             }
-            Message::CapsuleRadiusChanged(radius) => {
-                self.capsules[self.selected_capsule_index].radius = radius;
+            Message::CapsuleRadiusChanged(capsule_index, radius) => {
+                self.hinges[self.selected_hinge_index].capsules[capsule_index].radius = radius;
                 self.init_world();
                 self.cache.clear();
             }
-            Message::CapsuleAngleChanged(angle) => {
-                self.capsules[self.selected_capsule_index].angle = angle;
+            Message::CapsuleAngleChanged(capsule_index, angle) => {
+                self.hinges[self.selected_hinge_index].capsules[capsule_index].angle = angle;
+                self.init_world();
+                self.cache.clear();
+            }
+            Message::JointMinAngleChanged(min_angle) => {
+                self.hinges[self.selected_hinge_index].min_angle = min_angle;
+                self.init_world();
+                self.cache.clear();
+            }
+            Message::JointMaxAngleChanged(max_angle) => {
+                self.hinges[self.selected_hinge_index].max_angle = max_angle;
                 self.init_world();
                 self.cache.clear();
             }
@@ -235,7 +327,7 @@ impl Application for PhysicsSimulation {
     }
 
     fn view(&self) -> Element<Message> {
-        let controls = view_controls(&self.capsules, self.selected_capsule_index, self.is_playing);
+        let controls = view_controls(&self.hinges, self.selected_hinge_index, self.is_playing);
 
         let canvas = canvas(self as &Self)
             .width(Length::Fill)
@@ -267,20 +359,15 @@ impl<Message> canvas::Program<Message> for PhysicsSimulation {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        let selected_capsule = &self.capsules[self.selected_capsule_index];
-        let selected_capsule_body = &self.rigid_body_set[selected_capsule.body_handle];
-        let selected_capsule_position = selected_capsule_body.translation();
-        let selected_capsule_velocity = selected_capsule_body.linvel();
-        let selected_capsule_rotation = selected_capsule_body.rotation();
+        let selected_hinge = &self.hinges[self.selected_hinge_index];
+        let joint = self
+            .impulse_joint_set
+            .get(selected_hinge.joint_handle)
+            .unwrap();
+        let rotation = joint.data.local_frame1.rotation;
 
-        *self.debug_text.borrow_mut() = format!(
-            "Capsule position: ({:.2},{:.2}), velocity: ({:.2},{:.2}), angle: {:.2}",
-            selected_capsule_position.x,
-            selected_capsule_position.y,
-            selected_capsule_velocity.x,
-            selected_capsule_velocity.y,
-            selected_capsule_rotation.angle()
-        );
+        let mut debug_text_vec: Vec<String> = Vec::new();
+        debug_text_vec.push(format!("Joint rotation: {:.2}", rotation.angle()));
 
         let offset_factor = Vector::new(
             bounds.width / 2.0,
@@ -291,48 +378,51 @@ impl<Message> canvas::Program<Message> for PhysicsSimulation {
             // Clear the frame with the background color
             frame.fill_rectangle(Point::ORIGIN, bounds.size(), BACKGROUND_COLOR);
 
-            // Draw the capsules
-            for capsule in &self.capsules {
-                let capsule_body = &self.rigid_body_set[capsule.body_handle];
-                let capsule_position = capsule_body.translation();
-                let capsule_rotation = capsule_body.rotation();
+            // Draw the hinges
+            for (i_hinge, hinge) in self.hinges.iter().enumerate() {
+                for capsule in &hinge.capsules {
+                    let capsule_body = &self.rigid_body_set[capsule.body_handle];
+                    let capsule_position = capsule_body.translation();
+                    let capsule_rotation = capsule_body.rotation();
 
-                // Scale and offset the capsule's position
-                let scaled_capsule_position: Point = Point::new(
-                    (-capsule_position.x * SCALE_FACTOR) + offset_factor.x,
-                    offset_factor.y - (capsule_position.y * SCALE_FACTOR),
-                );
-                let scaled_capsule_radius: f32 = capsule.radius * SCALE_FACTOR;
-                let scaled_capsule_half_length: f32 = capsule.length * SCALE_FACTOR / 2.0;
-
-                // Draw the capsule
-                let capsule_path = Path::line(
-                    Point::new(-scaled_capsule_half_length, 0.0),
-                    Point::new(scaled_capsule_half_length, 0.0),
-                );
-                let capsule_stroke_outline = Stroke {
-                    style: Style::Solid(Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
-                    width: scaled_capsule_radius,
-                    line_cap: LineCap::Round,
-                    ..Stroke::default()
-                };
-                let capsule_stroke = Stroke {
-                    style: Style::Solid(capsule.color),
-                    width: scaled_capsule_radius - 1.0,
-                    line_cap: LineCap::Round,
-                    ..Stroke::default()
-                };
-
-                frame.with_save(|frame| {
-                    frame.translate(iced::Vector::new(
-                        scaled_capsule_position.x,
-                        scaled_capsule_position.y,
+                    debug_text_vec.push(format!(
+                        "Capsule {} rotation: {:.2}",
+                        2 * i_hinge + 1,
+                        capsule_rotation.angle()
                     ));
-                    frame.rotate(capsule_rotation.angle());
-                    frame.stroke(&capsule_path, capsule_stroke_outline);
-                    frame.stroke(&capsule_path, capsule_stroke);
-                });
+
+                    // Scale and offset the capsule's position
+                    let scaled_capsule_position: Point = Point::new(
+                        (capsule_position.x * SCALE_FACTOR) + offset_factor.x,
+                        offset_factor.y - (capsule_position.y * SCALE_FACTOR),
+                    );
+                    let scaled_capsule_radius: f32 = capsule.radius * SCALE_FACTOR;
+                    let scaled_capsule_half_length: f32 = capsule.length * SCALE_FACTOR / 2.0;
+
+                    // Draw the capsule
+                    let capsule_path = Path::line(
+                        Point::new(0.0, -scaled_capsule_half_length),
+                        Point::new(0.0, scaled_capsule_half_length),
+                    );
+                    let capsule_stroke = Stroke {
+                        style: Style::Solid(capsule.color),
+                        width: scaled_capsule_radius,
+                        line_cap: LineCap::Round,
+                        ..Stroke::default()
+                    };
+
+                    frame.with_save(|frame| {
+                        frame.translate(iced::Vector::new(
+                            scaled_capsule_position.x,
+                            scaled_capsule_position.y,
+                        ));
+                        frame.rotate(capsule_rotation.angle());
+                        frame.stroke(&capsule_path, capsule_stroke)
+                    });
+                }
             }
+
+            *self.debug_text.borrow_mut() = debug_text_vec.join("\n");
 
             // Draw the ground
             let ground_rect = Rectangle::new(
@@ -341,14 +431,13 @@ impl<Message> canvas::Program<Message> for PhysicsSimulation {
             );
             frame.fill_rectangle(ground_rect.position(), ground_rect.size(), GROUND_COLOR);
         });
-
         vec![physics_geometry]
     }
 }
 
 fn view_controls<'a>(
-    capsules: &[Capsule],
-    selected_capsule_index: usize,
+    hinges: &[Hinge],
+    selected_hinge_index: usize,
     is_playing: bool,
 ) -> Element<'a, Message> {
     let mut playback_controls = Row::new().spacing(10);
@@ -359,58 +448,75 @@ fn view_controls<'a>(
             playback_controls.push(button("Step").on_press(Message::StepSimulation));
     }
     playback_controls = playback_controls.push(button("Reset").on_press(Message::ResetSimulation));
-
-    let capsule_selector = capsules
+    let hinge_selector = hinges
         .iter()
         .enumerate()
-        .fold(Row::new(), |row, (index, _capsule)| {
+        .fold(Row::new(), |row, (index, _hinge)| {
             row.push(
-                button(text(format!("Capsule {}", index + 1)))
-                    .style(if index == selected_capsule_index {
+                button(text(format!("Hinge {}", index + 1)))
+                    .style(if index == selected_hinge_index {
                         iced::theme::Button::Primary
                     } else {
                         iced::theme::Button::Secondary
                     })
-                    .on_press(Message::CapsuleSelected(index)),
+                    .on_press(Message::HingeSelected(index)),
             )
         });
 
-    let selected_capsule = &capsules[selected_capsule_index];
+    let selected_hinge = &hinges[selected_hinge_index];
 
-    let length_slider = column![
-        text("Capsule Length"),
-        slider(
-            1.0..=10.0,
-            selected_capsule.length,
-            Message::CapsuleLengthChanged
+    let capsule_controls = selected_hinge.capsules.iter().enumerate().fold(
+        Column::new().spacing(10),
+        |column, (capsule_index, capsule)| {
+            let length_slider = slider(1.0..=10.0, capsule.length, move |value| {
+                Message::CapsuleLengthChanged(capsule_index, value)
+            })
+            .step(0.1);
+
+            let radius_slider = slider(0.1..=5.0, capsule.radius, move |value| {
+                Message::CapsuleRadiusChanged(capsule_index, value)
+            })
+            .step(0.1);
+
+            let angle_slider = slider(
+                -std::f32::consts::PI..=std::f32::consts::PI,
+                capsule.angle,
+                move |value| Message::CapsuleAngleChanged(capsule_index, value),
+            )
+            .step(0.1);
+
+            column
+                .push(text(format!("Capsule {}", capsule_index + 1)))
+                .push(length_slider)
+                .push(radius_slider)
+                .push(angle_slider)
+        },
+    );
+
+    let joint_controls = Column::new()
+        .push(text("Joint Limits"))
+        .push(
+            slider(
+                -std::f32::consts::PI..=std::f32::consts::PI,
+                selected_hinge.min_angle,
+                Message::JointMinAngleChanged,
+            )
+            .step(0.1),
         )
-        .step(0.1)
-    ];
-    let radius_slider = column![
-        text("Capsule radius"),
-        slider(
-            0.1..=5.0,
-            selected_capsule.radius,
-            Message::CapsuleRadiusChanged
-        )
-        .step(0.1)
-    ];
-    let angle_slider = column![
-        text("Capsule angle"),
-        slider(
-            -std::f32::consts::PI..=std::f32::consts::PI,
-            selected_capsule.angle,
-            Message::CapsuleAngleChanged,
-        )
-        .step(0.1)
-    ];
+        .push(
+            slider(
+                -std::f32::consts::PI..=std::f32::consts::PI,
+                selected_hinge.max_angle,
+                Message::JointMaxAngleChanged,
+            )
+            .step(0.1),
+        );
 
     column![
         playback_controls,
-        capsule_selector,
-        length_slider,
-        radius_slider,
-        angle_slider,
+        hinge_selector,
+        capsule_controls,
+        joint_controls,
     ]
     .padding(10)
     .spacing(20)
