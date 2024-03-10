@@ -17,13 +17,15 @@ const GROUND_HEIGHT: f32 = 0.1;
 const GROUND_COLOR: Color = Color::from_rgb(0.5, 0.5, 0.5);
 const GROUND_RESTITUTION: f32 = 0.7;
 
-const GRAVITY: Vector<f32> = vector![0.0, -9.81];
-// const GRAVITY: Vector<f32> = vector![0.0, 0.0];
+// const GRAVITY: Vector<f32> = vector![0.0, -9.81];
+const GRAVITY: Vector<f32> = vector![0.0, 0.0];
 
 const SCALE_FACTOR: f32 = 50.0;
 const BACKGROUND_COLOR: Color = Color::WHITE;
 
 const TIME_STEP: u64 = 16;
+
+const MOTOR_DAMPING: f32 = 1.0;
 
 pub fn main() -> iced::Result {
     PhysicsSimulation::run(Settings::default())
@@ -44,6 +46,7 @@ struct Hinge {
     origin: Point,
     min_angle: f32,
     max_angle: f32,
+    motor_target_velocity: f32,
 }
 
 struct PhysicsSimulation {
@@ -79,6 +82,7 @@ enum Message {
     CapsuleAngleChanged(usize, f32),
     JointMinAngleChanged(f32),
     JointMaxAngleChanged(f32),
+    MotorTargetVelocityChanged(f32),
 }
 
 impl PhysicsSimulation {
@@ -170,6 +174,10 @@ impl PhysicsSimulation {
                 .local_anchor1(point![0.0, 0.0])
                 .local_anchor2(point![0.0, 0.0])
                 .limits([hinge.min_angle, hinge.max_angle])
+                // Factor is the damping coefficient of the motor’s spring-like equation.
+                .motor_velocity(hinge.motor_target_velocity, MOTOR_DAMPING)
+                .motor_max_force(f32::MAX)
+                .motor_model(MotorModel::ForceBased)
                 .build();
             hinge.joint_handle = self.impulse_joint_set.insert(
                 hinge.capsules[0].body_handle,
@@ -241,6 +249,7 @@ impl Application for PhysicsSimulation {
                     origin: Point::new(0.0, 5.0),
                     min_angle: -std::f32::consts::FRAC_PI_2,
                     max_angle: std::f32::consts::FRAC_PI_2,
+                    motor_target_velocity: 0.0,
                 },
                 // Add more hinges here...
             ],
@@ -321,6 +330,25 @@ impl Application for PhysicsSimulation {
                 self.init_world();
                 self.cache.clear();
             }
+            Message::MotorTargetVelocityChanged(target_velocity) => {
+                // This updates the motor's target velocity in during the simulation
+                // TODO: find a better way to change target velocity
+                // This does not appear to cause a memory leak but it seems awful
+                self.hinges[self.selected_hinge_index].motor_target_velocity = target_velocity;
+                let joint_handle: ImpulseJointHandle = self.hinges[self.selected_hinge_index].joint_handle;
+                let joint: ImpulseJoint = self
+                    .impulse_joint_set
+                    .remove(joint_handle, true)
+                    .unwrap();
+                
+                let mut revolute_joint: RevoluteJoint = joint.data.as_revolute().unwrap().clone();
+                revolute_joint.set_motor_velocity(target_velocity, MOTOR_DAMPING);
+            
+                let new_joint_handle: ImpulseJointHandle = self
+                    .impulse_joint_set
+                    .insert(joint.body1, joint.body2, revolute_joint, true);
+                self.hinges[self.selected_hinge_index].joint_handle = new_joint_handle;
+            }
         }
 
         Command::none()
@@ -393,7 +421,7 @@ impl<Message> canvas::Program<Message> for PhysicsSimulation {
 
                     // Scale and offset the capsule's position
                     let scaled_capsule_position: Point = Point::new(
-                        (capsule_position.x * SCALE_FACTOR) + offset_factor.x,
+                        (-capsule_position.x * SCALE_FACTOR) + offset_factor.x,
                         offset_factor.y - (capsule_position.y * SCALE_FACTOR),
                     );
                     let scaled_capsule_radius: f32 = capsule.radius * SCALE_FACTOR;
@@ -512,11 +540,21 @@ fn view_controls<'a>(
             .step(0.1),
         );
 
+    let motor_controls = Column::new().push(text("Motor Target Velocity")).push(
+        slider(
+            -10.0..=10.0,
+            selected_hinge.motor_target_velocity,
+            Message::MotorTargetVelocityChanged,
+        )
+        .step(0.1),
+    );
+
     column![
         playback_controls,
         hinge_selector,
         capsule_controls,
         joint_controls,
+        motor_controls
     ]
     .padding(10)
     .spacing(20)
