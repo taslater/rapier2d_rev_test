@@ -10,6 +10,7 @@ use iced::widget::{button, canvas, column, container, slider, text, Row};
 use iced::{
     Application, Color, Command, Element, Length, Point, Rectangle, Settings, Size, Subscription,
 };
+use rapier2d::na::OPoint;
 use rapier2d::prelude::*;
 
 const GROUND_WIDTH: f32 = 100.0;
@@ -17,15 +18,15 @@ const GROUND_HEIGHT: f32 = 0.1;
 const GROUND_COLOR: Color = Color::from_rgb(0.5, 0.5, 0.5);
 const GROUND_RESTITUTION: f32 = 0.7;
 
-// const GRAVITY: Vector<f32> = vector![0.0, -9.81];
-const GRAVITY: Vector<f32> = vector![0.0, 0.0];
+const GRAVITY: Vector<f32> = vector![0.0, -9.81];
+// const GRAVITY: Vector<f32> = vector![0.0, 0.0];
 
 const SCALE_FACTOR: f32 = 50.0;
 const BACKGROUND_COLOR: Color = Color::WHITE;
 
 const TIME_STEP: u64 = 16;
 
-const MOTOR_DAMPING: f32 = 1.0;
+const MOTOR_DAMPING: f32 = 10.0;
 
 pub fn main() -> iced::Result {
     PhysicsSimulation::run(Settings::default())
@@ -85,6 +86,37 @@ enum Message {
     MotorTargetVelocityChanged(f32),
 }
 
+fn create_capsule(
+    hinge: &mut Hinge,
+    capsule_index: usize,
+    group: u32,
+    rigid_body_set: &mut RigidBodySet,
+    collider_set: &mut ColliderSet,
+) {
+    let body = RigidBodyBuilder::dynamic()
+        .translation(vector![hinge.origin.x, hinge.origin.y])
+        .build();
+    let offset_x: f32 =
+        -hinge.capsules[capsule_index].angle.sin() * hinge.capsules[capsule_index].length / 2.0;
+    let offset_y: f32 =
+        hinge.capsules[capsule_index].angle.cos() * hinge.capsules[capsule_index].length / 2.0;
+    let pt_a: OPoint<f32, nalgebra::Const<2>> = point!(offset_x, offset_y);
+    let pt_b: OPoint<f32, nalgebra::Const<2>> = point!(-offset_x, -offset_y);
+    let collider = ColliderBuilder::new(SharedShape::capsule(
+        pt_a,
+        pt_b,
+        hinge.capsules[capsule_index].radius / 2.0,
+    ))
+    .collision_groups(InteractionGroups::new(group.into(), 0b0001.into()))
+    .build();
+    hinge.capsules[capsule_index].body_handle = rigid_body_set.insert(body);
+    hinge.capsules[capsule_index].collider_handle = collider_set.insert_with_parent(
+        collider,
+        hinge.capsules[capsule_index].body_handle,
+        rigid_body_set,
+    );
+}
+
 impl PhysicsSimulation {
     fn init_world(&mut self) {
         // Iterate over all the rigid bodies and remove them
@@ -123,54 +155,11 @@ impl PhysicsSimulation {
 
         // Create the hinges
         for hinge in &mut self.hinges {
-            let hinge_group = 0b0001;
-            let capsule1_group = 0b0010;
-            let capsule2_group = 0b0100;
-
-            // Create the first capsule
-            let capsule1_body = RigidBodyBuilder::dynamic()
-                .translation(vector![hinge.origin.x, hinge.origin.y])
-                .rotation(hinge.capsules[0].angle)
-                .build();
-            let capsule1_collider = ColliderBuilder::capsule_y(
-                hinge.capsules[0].length / 2.0,
-                hinge.capsules[0].radius / 2.0,
-            )
-            .collision_groups(InteractionGroups::new(
-                capsule1_group.into(),
-                hinge_group.into(),
-            ))
-            .build();
-            hinge.capsules[0].body_handle = self.rigid_body_set.insert(capsule1_body);
-            hinge.capsules[0].collider_handle = self.collider_set.insert_with_parent(
-                capsule1_collider,
-                hinge.capsules[0].body_handle,
-                &mut self.rigid_body_set,
-            );
-
-            // Create the second capsule
-            let capsule2_body = RigidBodyBuilder::dynamic()
-                .translation(vector![hinge.origin.x, hinge.origin.y])
-                .rotation(hinge.capsules[1].angle)
-                .build();
-            let capsule2_collider = ColliderBuilder::capsule_y(
-                hinge.capsules[1].length / 2.0,
-                hinge.capsules[1].radius / 2.0,
-            )
-            .collision_groups(InteractionGroups::new(
-                capsule2_group.into(),
-                hinge_group.into(),
-            ))
-            .build();
-            hinge.capsules[1].body_handle = self.rigid_body_set.insert(capsule2_body);
-            hinge.capsules[1].collider_handle = self.collider_set.insert_with_parent(
-                capsule2_collider,
-                hinge.capsules[1].body_handle,
-                &mut self.rigid_body_set,
-            );
+            create_capsule(hinge, 0, 0b0010, &mut self.rigid_body_set, &mut self.collider_set);
+            create_capsule(hinge, 1, 0b0100, &mut self.rigid_body_set, &mut self.collider_set);
 
             // Create the revolute joint
-            let revolute_joint = RevoluteJointBuilder::new()
+            let revolute_joint: RevoluteJoint = RevoluteJointBuilder::new()
                 .local_anchor1(point![0.0, 0.0])
                 .local_anchor2(point![0.0, 0.0])
                 .limits([hinge.min_angle, hinge.max_angle])
@@ -335,18 +324,17 @@ impl Application for PhysicsSimulation {
                 // TODO: find a better way to change target velocity
                 // This does not appear to cause a memory leak but it seems awful
                 self.hinges[self.selected_hinge_index].motor_target_velocity = target_velocity;
-                let joint_handle: ImpulseJointHandle = self.hinges[self.selected_hinge_index].joint_handle;
-                let joint: ImpulseJoint = self
-                    .impulse_joint_set
-                    .remove(joint_handle, true)
-                    .unwrap();
-                
+                let joint_handle: ImpulseJointHandle =
+                    self.hinges[self.selected_hinge_index].joint_handle;
+                let joint: ImpulseJoint =
+                    self.impulse_joint_set.remove(joint_handle, true).unwrap();
+
                 let mut revolute_joint: RevoluteJoint = joint.data.as_revolute().unwrap().clone();
                 revolute_joint.set_motor_velocity(target_velocity, MOTOR_DAMPING);
-            
-                let new_joint_handle: ImpulseJointHandle = self
-                    .impulse_joint_set
-                    .insert(joint.body1, joint.body2, revolute_joint, true);
+
+                let new_joint_handle: ImpulseJointHandle =
+                    self.impulse_joint_set
+                        .insert(joint.body1, joint.body2, revolute_joint, true);
                 self.hinges[self.selected_hinge_index].joint_handle = new_joint_handle;
             }
         }
@@ -409,14 +397,16 @@ impl<Message> canvas::Program<Message> for PhysicsSimulation {
             // Draw the hinges
             for (i_hinge, hinge) in self.hinges.iter().enumerate() {
                 for capsule in &hinge.capsules {
-                    let capsule_body = &self.rigid_body_set[capsule.body_handle];
+                    let capsule_body: &RigidBody = &self.rigid_body_set[capsule.body_handle];
+                    let capsule_collider: &Collider = &self.collider_set[capsule.collider_handle];
                     let capsule_position = capsule_body.translation();
-                    let capsule_rotation = capsule_body.rotation();
+                    let capsule_rotation: f32 = capsule_collider.rotation().angle() + capsule.angle;
+                    // let capsule_rotation = capsule_body.rotation().angle();
 
                     debug_text_vec.push(format!(
                         "Capsule {} rotation: {:.2}",
                         2 * i_hinge + 1,
-                        capsule_rotation.angle()
+                        capsule_rotation
                     ));
 
                     // Scale and offset the capsule's position
@@ -444,7 +434,7 @@ impl<Message> canvas::Program<Message> for PhysicsSimulation {
                             scaled_capsule_position.x,
                             scaled_capsule_position.y,
                         ));
-                        frame.rotate(capsule_rotation.angle());
+                        frame.rotate(capsule_rotation);
                         frame.stroke(&capsule_path, capsule_stroke)
                     });
                 }
